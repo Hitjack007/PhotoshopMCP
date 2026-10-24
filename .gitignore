@@ -21,3 +21,6 @@ exports/
 coverage/
 .turbo/
 *.tsbuildinfo
+
+# Personal Claude skill entry point (contains local absolute paths)
+claude-skill/photoshop/SKILL.md
