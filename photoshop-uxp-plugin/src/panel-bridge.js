@@ -12,8 +12,18 @@ var POLL_IDLE_AFTER_MS = 60000;
 var POLL_RETRY_MAX_MS = 5000;
 var lastJobAt = 0;
 
+// Session lock: one long executeAsModal scope that runs incoming jobs, so the
+// user stays locked out for the whole build instead of only during each job.
+var SESSION_IDLE_DEFAULT_MS = 60000;
+var SESSION_IDLE_MAX_MS = 30 * 60000;
+var session = null;
+// Document the last pinned job targeted, shown in the panel
+var lastTarget = null;
+
 var statusBadge = document.getElementById("status-badge");
+var activityEl = document.getElementById("activity");
 var docNameEl = document.getElementById("doc-name");
+var targetNameEl = document.getElementById("target-name");
 var btnConnect = document.getElementById("btn-connect");
 var btnRefresh = document.getElementById("btn-refresh");
 var btnRunLast = document.getElementById("btn-run-last");
@@ -70,13 +80,23 @@ function setStatus(state) {
   if (!connected) btnRunLast.disabled = true;
 }
 
+// "idle", "working" (one job) or "session" (locked for a build)
+function setActivity(state, detail) {
+  activityEl.className = "activity " + state;
+  if (state === "session") activityEl.textContent = "Claude session: hands off" + (detail ? " (" + detail + ")" : "") + ". Cancel in Photoshop's progress dialog to stop.";
+  else if (state === "working") activityEl.textContent = "Claude working: " + (detail || "job");
+  else activityEl.textContent = "Idle";
+}
+
 function refreshDoc() {
+  var front = null;
   try {
-    var doc = activeDocumentOrNull(require("photoshop").app);
-    docNameEl.textContent = doc ? doc.title : "-";
-  } catch (e) {
-    docNameEl.textContent = "-";
-  }
+    front = activeDocumentOrNull(require("photoshop").app);
+  } catch (e) {}
+  docNameEl.textContent = front ? front.title : "-";
+  targetNameEl.textContent = lastTarget ? lastTarget.title || String(lastTarget.id) : "-";
+  // Highlight when Claude's target isn't the document in front
+  targetNameEl.className = "doc-name" + (lastTarget && front && front.id !== lastTarget.id ? " mismatch" : "");
 }
 
 function connect(retrying) {
@@ -117,24 +137,29 @@ function schedulePoll(delayMs) {
   pollTimer = setTimeout(pollNextJob, delayMs);
 }
 
+// Resolves to the next queued job, or null when the queue is empty
+function fetchNextJob() {
+  return fetch(getUrl() + "/jobs/next", {
+    headers: { "X-Bridge-Token": getToken() }
+  }).then(function (res) {
+    if (res.status === 204) return null;
+    if (res.status === 401) {
+      var authErr = new Error("Unauthorized: token does not match bridge");
+      authErr.fatal = true;
+      throw authErr;
+    }
+    if (!res.ok) throw new Error("Polling returned " + res.status);
+    return res.json();
+  });
+}
+
 // Poll one job at a time: Photoshop rejects overlapping executeAsModal calls,
 // so the next poll is only scheduled after the current job has finished.
+// While a session is open, its own loop polls instead.
 function pollNextJob() {
   pollTimer = null;
-  if (!connected || jobRunning) return;
-  fetch(getUrl() + "/jobs/next", {
-    headers: { "X-Bridge-Token": getToken() }
-  })
-    .then(function (res) {
-      if (res.status === 204) return null;
-      if (res.status === 401) {
-        var authErr = new Error("Unauthorized: token does not match bridge");
-        authErr.fatal = true;
-        throw authErr;
-      }
-      if (!res.ok) throw new Error("Polling returned " + res.status);
-      return res.json();
-    })
+  if (!connected || jobRunning || session) return;
+  fetchNextJob()
     .then(function (job) {
       if (pollFailures > 0) log("Bridge reachable again", "ok");
       pollFailures = 0;
@@ -256,15 +281,26 @@ function sendResult(jobId, result) {
 }
 
 async function handleJob(jobId, jobType, payload) {
+  payload = payload || {};
+  if (payload.documentId !== undefined && payload.documentId !== null) {
+    lastTarget = { id: payload.documentId, title: payload.documentTitle };
+    refreshDoc();
+  }
+  if (!session) setActivity("working", payload.historyName || jobType);
+  var result;
   try {
-    var result = await executeJobLocal(jobId, jobType, payload || {});
+    result = await executeJobLocal(jobId, jobType, payload);
     log("Done: " + jobType, result.ok ? "ok" : "error");
-    sendResult(jobId, result);
   } catch (e) {
     var errMsg = e ? (e.message || e.description || (typeof e === "string" ? e : JSON.stringify(e))) : "Unknown error";
     log("Job failed: " + errMsg, "error");
-    sendResult(jobId, { ok: false, message: String(errMsg), data: null, warnings: [], jobId: jobId, photoshopStatus: "connected" });
+    result = { ok: false, message: String(errMsg), data: null, warnings: [], jobId: jobId, photoshopStatus: "connected" };
   }
+  // Tells the CLI whether this job ran inside a session lock
+  result.session = !!session;
+  sendResult(jobId, result);
+  if (session) setActivity("session", session.label);
+  else setActivity("idle");
 }
 
 function ok(jobId, data, message) {
@@ -286,6 +322,15 @@ async function executeJobLocal(jobId, jobType, payload) {
   if (jobType === "batchPlay") return ok(jobId, await runBatchPlay(payload));
   if (jobType === "getDocumentState") return ok(jobId, await getDocumentState(payload));
   if (jobType === "exportPreview") return ok(jobId, await exportPreview(payload));
+  if (jobType === "beginSession") return ok(jobId, await beginSession(payload), "Session started");
+  if (jobType === "endSession") {
+    var wasOpen = !!session;
+    if (session) session.ending = true;
+    return ok(jobId, { ended: wasOpen }, wasOpen ? "Session ending" : "No session was open");
+  }
+
+  // The jobs below open their own executeAsModal, which can't run inside a session
+  if (session) throw new Error(jobType + " can't run inside a session. Run `ps.mjs session end` first.");
 
   // placeAsset needs its own executeAsModal (cannot nest placeEvent inside another modal)
   if (jobType === "placeAsset") {
@@ -570,19 +615,66 @@ async function fileEntry(path, options) {
   return await lfs.getEntryWithUrl(url);
 }
 
-// Run modal work on the active document as a single history step.
+function findDocument(app, id) {
+  for (var i = 0; i < app.documents.length; i++) {
+    if (app.documents[i].id === id) return app.documents[i];
+  }
+  return null;
+}
+
+function hasTarget(payload) {
+  return payload.documentId !== undefined && payload.documentId !== null;
+}
+
+// The document a job is pinned to (payload.documentId), never whichever one is
+// in front. Jobs without a documentId fall back to the active document.
+function targetDocument(app, payload) {
+  if (!hasTarget(payload)) return activeDocumentOrNull(app);
+  var doc = findDocument(app, payload.documentId);
+  if (!doc) {
+    throw new Error("Target document " + (payload.documentTitle ? payload.documentTitle + " (id " + payload.documentId + ")" : payload.documentId) +
+      " is no longer open. Run `ps.mjs target` again.");
+  }
+  return doc;
+}
+
+// Scripts and targetEnum descriptors act on the front document, so a pinned
+// edit only runs when its target is in front. Call this inside the modal scope:
+// Photoshop blocks input there, so the front document can't change before the edit.
+function ensureTargetInFront(app, doc) {
+  var front = activeDocumentOrNull(app);
+  if (!doc || (front && front.id === doc.id)) return;
+  if (session) {
+    // The user is locked out, so only Claude's own scripts can have switched documents
+    app.activeDocument = doc;
+    return;
+  }
+  throw new Error("Active document changed (you're in " + (front ? front.title : "no document") + ", I expected " + doc.title + "). Nothing was changed.");
+}
+
+// Run modal work, reusing the session's modal scope when one is open
+async function withModal(name, work) {
+  if (session) {
+    try { session.executionContext.reportProgress({ commandName: "Claude: " + session.label + " - " + name }); } catch (e) {}
+    return work(session.executionContext);
+  }
+  return require("photoshop").core.executeAsModal(work, { commandName: name });
+}
+
+// Run modal work on the job's target document as a single history step.
 // If the work throws, the history step is rolled back so the document is untouched.
-async function runAsHistoryStep(name, useHistory, work) {
+async function runAsHistoryStep(name, useHistory, payload, work) {
   var ps = require("photoshop");
-  return ps.core.executeAsModal(async function (executionContext) {
-    var doc = activeDocumentOrNull(ps.app);
+  return withModal(name, async function (executionContext) {
+    var doc = targetDocument(ps.app, payload);
+    if (hasTarget(payload)) ensureTargetInFront(ps.app, doc);
     var suspensionId = null;
     if (doc && useHistory !== false) {
       suspensionId = await executionContext.hostControl.suspendHistory({ documentID: doc.id, name: name });
     }
     var succeeded = false;
     try {
-      var value = await work(executionContext);
+      var value = await work(executionContext, doc);
       succeeded = true;
       return value;
     } finally {
@@ -594,7 +686,7 @@ async function runAsHistoryStep(name, useHistory, work) {
         }
       }
     }
-  }, { commandName: name });
+  });
 }
 
 async function runScript(payload) {
@@ -608,13 +700,16 @@ async function runScript(payload) {
   var fn;
   try {
     fn = new AsyncFunction(
-      "ps", "app", "batchPlay", "core", "constants", "uxp", "fs", "args", "executionContext", "log", "fileEntry",
+      "ps", "app", "batchPlay", "core", "constants", "uxp", "fs", "args", "executionContext", "log", "fileEntry", "doc",
       payload.code
     );
   } catch (e) {
     var msg = errorMessage(e);
     if (/code generation|eval|unsafe/i.test(msg)) {
       throw new Error("Script compilation is blocked (" + msg + "). Reload the plugin in UXP Developer Tool so the manifest permission allowCodeGenerationFromStrings takes effect.");
+    }
+    if (/\bdoc\b.*already been declared/.test(msg)) {
+      throw new Error("Script syntax error: " + msg + ". `doc` is already defined as the target document; remove your `const doc = ...` line.");
     }
     throw new Error("Script syntax error: " + msg);
   }
@@ -623,15 +718,17 @@ async function runScript(payload) {
   function scriptLog() {
     logs.push(Array.prototype.map.call(arguments, formatLogArg).join(" "));
   }
-  function run(executionContext) {
+  function run(executionContext, doc) {
     return fn(ps, ps.app, ps.action.batchPlay, ps.core, ps.constants, uxp, nodeFs,
-      payload.args || {}, executionContext, scriptLog, fileEntry);
+      payload.args || {}, executionContext, scriptLog, fileEntry, doc);
   }
 
   var name = payload.historyName || "Claude edit";
   var value;
   try {
-    value = payload.modal === false ? await run(null) : await runAsHistoryStep(name, payload.history, run);
+    value = payload.modal === false
+      ? await run(null, targetDocument(ps.app, payload))
+      : await runAsHistoryStep(name, payload.history, payload, run);
   } catch (e) {
     var err = new Error(errorMessage(e) + (logs.length ? "\nScript log:\n" + logs.join("\n") : ""));
     throw err;
@@ -644,7 +741,7 @@ async function runBatchPlay(payload) {
   if (!descriptors || !descriptors.length) throw new Error("batchPlay requires descriptors");
   var batchPlay = require("photoshop").action.batchPlay;
   var name = payload.historyName || "Claude batchPlay";
-  var results = await runAsHistoryStep(name, payload.history, function () {
+  var results = await runAsHistoryStep(name, payload.history, payload, function () {
     return batchPlay(descriptors, payload.options || {});
   });
   var failed = (results || []).filter(function (r) { return r && r._obj === "error"; });
@@ -705,16 +802,14 @@ async function getDocumentState(payload) {
     documents.push({ id: od.id, title: od.title, active: !!active && od.id === active.id });
   }
   var doc = active;
-  if (payload.documentId) {
-    doc = null;
-    for (var j = 0; j < app.documents.length; j++) {
-      if (app.documents[j].id === payload.documentId) doc = app.documents[j];
-    }
-    if (!doc) throw new Error("No open document with id " + payload.documentId);
+  if (hasTarget(payload)) {
+    // Read-only, so report a closed target instead of failing: the caller still needs the document list
+    doc = findDocument(app, payload.documentId);
+    if (!doc) return { documents: documents, document: null, targetMissing: true };
   }
   if (!doc) return { documents: documents, document: null };
 
-  var info = { id: doc.id, title: doc.title };
+  var info = { id: doc.id, title: doc.title, inFront: !!active && active.id === doc.id };
   function grab(key, getter) {
     try {
       var v = getter();
@@ -740,14 +835,15 @@ async function getDocumentState(payload) {
 async function exportPreview(payload) {
   var ps = require("photoshop");
   var app = ps.app;
-  var source = activeDocumentOrNull(app);
+  var source = targetDocument(app, payload);
   if (!source) throw new Error("No active document to preview");
   var maxSize = payload.maxSize || 2048;
 
   // Preferred: read the composite through the imaging API. No temporary document
-  // is opened, and the result is returned as a base64 JPEG flattened onto white.
+  // is opened, the target doesn't need to be in front, and the result is returned
+  // as a base64 JPEG flattened onto white.
   if (ps.imaging) {
-    return ps.core.executeAsModal(async function () {
+    return withModal("Claude preview", async function () {
       var scale = Math.min(1, maxSize / Math.max(source.width, source.height));
       var targetSize = {
         width: Math.max(1, Math.round(source.width * scale)),
@@ -768,12 +864,13 @@ async function exportPreview(payload) {
       } finally {
         pixels.imageData.dispose();
       }
-    }, { commandName: "Claude preview" });
+    });
   }
 
   // Fallback: save a merged, resized duplicate as PNG to payload.path
   if (!payload.path) throw new Error("exportPreview fallback requires an absolute output path");
-  return ps.core.executeAsModal(async function () {
+  return withModal("Claude preview", async function () {
+    var front = activeDocumentOrNull(app);
     var sourceWidth = source.width;
     var sourceHeight = source.height;
     // Merged duplicate keeps the original document and its history untouched
@@ -791,10 +888,81 @@ async function exportPreview(payload) {
       await copy.saveAs.png(entry, { compression: 6 }, true);
     } finally {
       await copy.closeWithoutSaving();
-      try { app.activeDocument = source; } catch (e) {}
+      // Put back whichever document the user had in front
+      try { if (front) app.activeDocument = front; } catch (e) {}
     }
     return { path: payload.path, width: width, height: height, sourceWidth: sourceWidth, sourceHeight: sourceHeight };
-  }, { commandName: "Claude preview" });
+  });
+}
+
+function delay(ms) {
+  return new Promise(function (resolve) { setTimeout(resolve, ms); });
+}
+
+// Open a session: one executeAsModal scope that keeps the user locked out while
+// it polls and runs jobs itself. Resolves as soon as the scope is open; the scope
+// closes on endSession, after idleMs without jobs, or when the user presses Cancel.
+function beginSession(payload) {
+  if (session) return Promise.reject(new Error("A session is already open (" + session.label + ")"));
+  var ps = require("photoshop");
+  var label = payload.label || "Claude session";
+  var idleMs = Math.min(Math.max(Number(payload.idleMs) || SESSION_IDLE_DEFAULT_MS, 5000), SESSION_IDLE_MAX_MS);
+
+  return new Promise(function (resolve, reject) {
+    ps.core.executeAsModal(async function (executionContext) {
+      var doc = targetDocument(ps.app, payload);
+      if (!doc) throw new Error("No document to lock a session to");
+      var front = activeDocumentOrNull(ps.app);
+      if (!front || front.id !== doc.id) ps.app.activeDocument = doc;
+      session = { executionContext: executionContext, label: label, idleMs: idleMs, lastJobAt: Date.now(), ending: false, jobs: 0 };
+      try { executionContext.reportProgress({ commandName: "Claude: " + label }); } catch (e) {}
+      setActivity("session", label);
+      log("Session started: " + label + " on " + doc.title, "ok");
+      resolve({ label: label, documentId: doc.id, title: doc.title, idleSeconds: idleMs / 1000 });
+      return runSessionLoop();
+    }, { commandName: "Claude: " + label }).then(function (reason) {
+      log("Session ended (" + reason + ")" + (session ? ", " + session.jobs + " jobs" : ""), reason === "cancelled" ? "warn" : "ok");
+    }, function (e) {
+      // Rejects the job only if the scope never opened; otherwise resolve already ran
+      reject(e);
+      if (session) log("Session ended with error: " + errorMessage(e), "error");
+    }).then(function () {
+      session = null;
+      setActivity("idle");
+      schedulePoll(0);
+    });
+  });
+}
+
+async function runSessionLoop() {
+  while (true) {
+    if (session.ending) return "ended";
+    if (session.executionContext.isCancelled) return "cancelled";
+    if (!connected) return "disconnected";
+    if (Date.now() - session.lastJobAt > session.idleMs) return "idle " + Math.round(session.idleMs / 1000) + "s";
+    var job;
+    try {
+      job = await fetchNextJob();
+    } catch (e) {
+      if (e.fatal) {
+        log(e.message, "error");
+        return "unauthorized";
+      }
+      await delay(POLL_INTERVAL_MS);
+      continue;
+    }
+    if (!job) {
+      await delay(POLL_INTERVAL_MS);
+      continue;
+    }
+    session.jobs++;
+    lastJobAt = Date.now();
+    log("Job received: " + job.type, "info");
+    lastJob = { jobId: job.id, jobType: job.type, payload: job.payload };
+    await handleJob(job.id, job.type, job.payload);
+    // Idle time counts from when a job finishes, so a long job can't end the session
+    session.lastJobAt = Date.now();
+  }
 }
 
 btnConnect.addEventListener("click", function () {
@@ -808,6 +976,10 @@ btnRefresh.addEventListener("click", function () {
 });
 
 btnRunLast.addEventListener("click", function () {
+  if (session || jobRunning) {
+    log("Claude is running a job; try again when it's idle", "warn");
+    return;
+  }
   if (lastJob) handleJob(lastJob.jobId + "_retry", lastJob.jobType, lastJob.payload);
 });
 
@@ -818,6 +990,7 @@ btnClearLog.addEventListener("click", function () {
 log("Panel bridge script loaded", "ok");
 var hasSavedToken = loadSettings();
 log("Bridge URL: " + getUrl(), "info");
+setActivity("idle");
 refreshDoc();
 setInterval(refreshDoc, 5000);
 if (hasSavedToken) connect();

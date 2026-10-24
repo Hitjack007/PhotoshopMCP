@@ -8,15 +8,24 @@
  *   ps.mjs bridge                     Start the local bridge if it isn't running
  *   ps.mjs stop                       Stop the local bridge
  *   ps.mjs status                     Bridge + Photoshop panel connection status
+ *   ps.mjs target [<title|id>]        Pin later jobs to this document (no argument: show the target)
+ *   ps.mjs target --active | --clear  Pin to the front document / forget the target
  *   ps.mjs state [--depth N] [--full-text]
- *                                     Open documents + full layer tree of the active one
+ *                                     Open documents + full layer tree of the target (or front) document
  *   ps.mjs preview [out.png] [--max PX]
- *                                     Flattened PNG of the active document (default max 2048px)
- *   ps.mjs run <file.js|-> [opts]     Run a UXP script inside Photoshop (one undo step)
+ *                                     Flattened image of the target document (default max 2048px)
+ *   ps.mjs run <file.js|-> [opts]     Run a UXP script on the target document (one undo step)
  *   ps.mjs eval '<code>' [opts]       Same as run, with inline code
  *   ps.mjs batchplay <file.json|->    Run an array of batchPlay descriptors (one undo step)
- *   ps.mjs open <file>                Open a PSD/image
- *   ps.mjs save [file]                Save the active document (Save As PSD when a path is given)
+ *   ps.mjs open <file>                Open a PSD/image and pin it as the target
+ *   ps.mjs save [file]                Save the target document (Save As PSD when a path is given)
+ *   ps.mjs session begin [--label TEXT] [--idle SEC]
+ *                                     Lock the user out of Photoshop until `session end`,
+ *                                     SEC seconds without jobs (default 60), or Cancel
+ *   ps.mjs session end                Release the lock
+ *
+ * run, eval, batchplay, preview, save and session begin need a target. They refuse
+ * when the user has another document in front instead of editing that one.
  *
  * run/eval options:
  *   --args '<json>'   Value exposed to the script as `args`
@@ -39,6 +48,9 @@ const BRIDGE_URL = process.env.BRIDGE_URL ?? `http://127.0.0.1:${PORT}`;
 const TOKEN = process.env.REMIRDY_BRIDGE_TOKEN ?? ENV.REMIRDY_BRIDGE_TOKEN ?? "dev_insecure_token";
 const OUT_DIR = path.join(os.tmpdir(), "claude-photoshop");
 const BRIDGE_LOG = path.join(OUT_DIR, "bridge.log");
+const TARGET_FILE = path.join(OUT_DIR, "target.json");
+// Present while this CLI believes a session lock is open
+const SESSION_FILE = path.join(OUT_DIR, "session.json");
 const BRIDGE_ENTRY = "apps/local-bridge/src/index.ts";
 // A bridge started by this CLI shuts itself down after this long without jobs
 const BRIDGE_IDLE_EXIT_MINUTES = process.env.BRIDGE_IDLE_EXIT_MINUTES ?? "15";
@@ -191,8 +203,55 @@ async function sendJob(type, payload, timeoutMs = 120_000) {
   }
   const result = res.data;
   if (!result || typeof result !== "object") fail(`unexpected bridge response (${res.status}): ${String(result)}`);
+  if (result.session === false && type !== "beginSession" && fs.existsSync(SESSION_FILE)) {
+    fs.rmSync(SESSION_FILE, { force: true });
+    process.stderr.write("warning: the session lock has ended (idle timeout or the user pressed Cancel). Jobs now run unlocked; run `session begin` again if needed.\n");
+  }
   if (!result.ok) fail(result.message ?? `job ${type} failed`);
   return result.data;
+}
+
+function readJson(file) {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
+}
+
+function writeJson(file, value) {
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(value) + "\n");
+}
+
+// Adds the pinned document to a job payload; refuses when no target is set
+function pinned(payload) {
+  const target = readJson(TARGET_FILE);
+  if (!target) fail("no target document. Run `ps.mjs target <title|id>` (or `target --active`) first.");
+  return { ...payload, documentId: target.id, documentTitle: target.title };
+}
+
+async function target(query, flags) {
+  if (flags.clear) {
+    fs.rmSync(TARGET_FILE, { force: true });
+    return { target: null };
+  }
+  const { documents } = await sendJob("getDocumentState", { maxDepth: 0 });
+  if (!query && !flags.active) {
+    const current = readJson(TARGET_FILE);
+    if (!current) return { target: null, documents, hint: "No target. Run: ps.mjs target <title|id>" };
+    return { target: current, open: documents.some((d) => d.id === current.id), documents };
+  }
+  let matches;
+  if (flags.active) {
+    matches = documents.filter((d) => d.active);
+  } else {
+    matches = /^\d+$/.test(query) ? documents.filter((d) => d.id === Number(query)) : [];
+    if (!matches.length) matches = documents.filter((d) => d.title === query);
+    if (!matches.length) matches = documents.filter((d) => d.title.toLowerCase() === query.toLowerCase());
+  }
+  const list = documents.map((d) => `${d.title} (id ${d.id})`).join(", ") || "none";
+  if (!matches.length) fail(`no open document matches ${flags.active ? "--active" : JSON.stringify(query)}. Open: ${list}`);
+  if (matches.length > 1) fail(`${matches.length} open documents are called ${JSON.stringify(query)}; pass the id instead. Open: ${list}`);
+  const pinnedDoc = { id: matches[0].id, title: matches[0].title };
+  writeJson(TARGET_FILE, pinnedDoc);
+  return { target: pinnedDoc };
 }
 
 function readSource(arg) {
@@ -240,19 +299,29 @@ async function main() {
     case "status":
       out = await status();
       break;
-    case "state":
-      out = await sendJob("getDocumentState", {
+    case "target":
+      out = await target(positional[0], flags);
+      break;
+    case "state": {
+      // Read-only, so it works without a target (then it describes the front document)
+      const current = readJson(TARGET_FILE);
+      const data = await sendJob("getDocumentState", {
         maxDepth: flags.depth !== undefined ? Number(flags.depth) : undefined,
         fullText: !!flags["full-text"],
+        ...(current ? { documentId: current.id, documentTitle: current.title } : {}),
       });
+      out = { target: current, ...data };
+      if (!current) out.hint = "No target. Run: ps.mjs target <title|id> before editing.";
+      else if (data.targetMissing) out.hint = `Target ${current.title} (id ${current.id}) is no longer open. Run: ps.mjs target <title|id>`;
       break;
+    }
     case "preview": {
       const maxSize = flags.max ? Number(flags.max) : 2048;
       const requested = path.resolve(positional[0] ?? path.join(OUT_DIR, `preview-${Date.now()}.jpg`));
       fs.mkdirSync(path.dirname(requested), { recursive: true });
       const stem = requested.replace(/\.(png|jpe?g)$/i, "");
       // With Photoshop's imaging API the panel returns a base64 JPEG; otherwise it writes this PNG itself
-      const data = await sendJob("exportPreview", { path: stem + ".png", maxSize });
+      const data = await sendJob("exportPreview", pinned({ path: stem + ".png", maxSize }));
       if (data.base64) {
         const file = stem + ".jpg";
         fs.writeFileSync(file, Buffer.from(data.base64, "base64"));
@@ -264,21 +333,21 @@ async function main() {
       break;
     }
     case "run":
-      out = await sendJob("runScript", scriptPayload(readSource(positional[0]), flags), timeoutFrom(flags));
+      out = await sendJob("runScript", pinned(scriptPayload(readSource(positional[0]), flags)), timeoutFrom(flags));
       break;
     case "eval":
       if (!positional[0]) fail("eval needs code");
-      out = await sendJob("runScript", scriptPayload(positional[0], flags), timeoutFrom(flags));
+      out = await sendJob("runScript", pinned(scriptPayload(positional[0], flags)), timeoutFrom(flags));
       break;
     case "batchplay": {
       let descriptors;
       try { descriptors = JSON.parse(readSource(positional[0])); } catch (e) { fail(`descriptor JSON invalid: ${e.message}`); }
       if (!Array.isArray(descriptors)) descriptors = [descriptors];
-      out = await sendJob("batchPlay", {
+      out = await sendJob("batchPlay", pinned({
         descriptors,
         historyName: typeof flags.name === "string" ? flags.name : undefined,
         history: flags.history !== false,
-      }, timeoutFrom(flags));
+      }), timeoutFrom(flags));
       break;
     }
     case "open": {
@@ -286,19 +355,19 @@ async function main() {
       const file = path.resolve(positional[0]);
       if (!fs.existsSync(file)) fail(`no such file: ${file}`);
       out = await sendJob("runScript", {
-        code: "const doc = await app.open(await fileEntry(args.path)); return { id: doc.id, title: doc.title, width: doc.width, height: doc.height };",
+        code: "const opened = await app.open(await fileEntry(args.path)); return { id: opened.id, title: opened.title, width: opened.width, height: opened.height };",
         args: { path: file },
         history: false,
       });
+      writeJson(TARGET_FILE, { id: out.id, title: out.title });
+      out.pinned = true;
       break;
     }
     case "save": {
       const file = positional[0] ? path.resolve(positional[0]) : null;
       if (file) fs.mkdirSync(path.dirname(file), { recursive: true });
-      out = await sendJob("runScript", {
+      out = await sendJob("runScript", pinned({
         code: [
-          "const doc = app.activeDocument;",
-          "if (!doc) throw new Error('No active document');",
           "if (args.path) { await doc.saveAs.psd(await fileEntry(args.path, { create: true }), { maximizeCompatibility: true }); }",
           "else { await doc.save(); }",
           "let savedPath = args.path; try { savedPath = doc.path || args.path; } catch (e) {}",
@@ -306,7 +375,22 @@ async function main() {
         ].join("\n"),
         args: { path: file },
         history: false,
-      });
+      }));
+      break;
+    }
+    case "session": {
+      if (positional[0] === "begin") {
+        out = await sendJob("beginSession", pinned({
+          label: typeof flags.label === "string" ? flags.label : undefined,
+          idleMs: flags.idle ? Number(flags.idle) * 1000 : undefined,
+        }));
+        writeJson(SESSION_FILE, out);
+      } else if (positional[0] === "end") {
+        out = await sendJob("endSession", {});
+        fs.rmSync(SESSION_FILE, { force: true });
+      } else {
+        fail("usage: session begin [--label TEXT] [--idle SEC] | session end");
+      }
       break;
     }
     default:

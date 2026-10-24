@@ -1,13 +1,12 @@
 # Photoshop UXP reference for /photoshop
 
-All snippets are script bodies for `ps.mjs run` (they assume `app`, `batchPlay`,
-`constants`, `args`, `fileEntry` are in scope). Photoshop's API shifts between versions; if a
+All snippets are script bodies for `ps.mjs run` (they assume `doc`, `app`, `batchPlay`,
+`constants`, `args`, `fileEntry` are in scope; `doc` is the pinned target document). Photoshop's API shifts between versions; if a
 recipe errors, get the exact descriptor with **Discovering descriptors** below instead of guessing.
 
 ## Helpers to paste at the top of a script
 
 ```js
-const doc = app.activeDocument;
 const findLayer = (layers, pred) => {
   for (const l of layers) {
     if (pred(l)) return l;
@@ -42,7 +41,8 @@ await doc.saveAs.psd(await fileEntry("/abs/out.psd", { create: true }), { maximi
 await doc.saveAs.png(await fileEntry("/abs/out.png", { create: true }), { compression: 6 }, true);   // true = as copy
 await doc.saveAs.jpg(await fileEntry("/abs/out.jpg", { create: true }), { quality: 10 }, true);
 await doc.closeWithoutSaving();
-app.activeDocument = Array.from(app.documents).find((d) => d.title === "Other.psd");
+// To work on another document, pin it with `ps.mjs target "Other.psd"` instead of switching
+// app.activeDocument inside a script (the next run would refuse: target no longer in front).
 ```
 
 ## Layers (DOM)
