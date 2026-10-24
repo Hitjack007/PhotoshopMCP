@@ -91,7 +91,7 @@ const t = await doc.createTextLayer({
 });
 const ti = byId(args.id).textItem;
 ti.contents = "New copy";
-ti.characterStyle.size = 48;            // points
+ti.characterStyle.size = 48;            // behaves as pixels: points = 48 × 72 / doc.resolution
 ti.characterStyle.font = "Inter-Bold";  // PostScript name
 ti.characterStyle.color = solid("#FF3366");
 ti.characterStyle.tracking = 50;

@@ -18,6 +18,8 @@
  *   ps.mjs eval '<code>' [opts]       Same as run, with inline code
  *   ps.mjs batchplay <file.json|->    Run an array of batchPlay descriptors (one undo step)
  *   ps.mjs open <file>                Open a PSD/image and pin it as the target
+ *   ps.mjs new --width PX --height PX [--res PPI] [--name NAME] [--fill white|black|transparent|backgroundColor]
+ *                                     Create an unsaved RGB document and pin it as the target
  *   ps.mjs save [file]                Save the target document (Save As PSD when a path is given)
  *   ps.mjs session begin [--label TEXT] [--idle SEC]
  *                                     Lock the user out of Photoshop until `session end`,
@@ -207,7 +209,8 @@ async function sendJob(type, payload, timeoutMs = 120_000) {
     fs.rmSync(SESSION_FILE, { force: true });
     process.stderr.write("warning: the session lock has ended (idle timeout or the user pressed Cancel). Jobs now run unlocked; run `session begin` again if needed.\n");
   }
-  if (!result.ok) fail(result.message ?? `job ${type} failed`);
+  // executeAsModal stringifies errors, so panel messages can arrive as "Error: ..."
+  if (!result.ok) fail(String(result.message ?? `job ${type} failed`).replace(/^(Error: )+/, ""));
   return result.data;
 }
 
@@ -220,11 +223,30 @@ function writeJson(file, value) {
   fs.writeFileSync(file, JSON.stringify(value) + "\n");
 }
 
-// Adds the pinned document to a job payload; refuses when no target is set
+function validTarget(value) {
+  return !!value && Number.isInteger(value.id);
+}
+
+// Stores the target document. Titles are only for messages; jobs match by id.
+function pin(doc) {
+  if (!validTarget(doc)) fail(`can't pin ${JSON.stringify(doc)}: no document id`);
+  const target = { id: doc.id, title: doc.title };
+  writeJson(TARGET_FILE, target);
+  return target;
+}
+
+// Adds the pinned document to a job payload; refuses when no valid target is set,
+// since a job without a documentId would act on whichever document is in front
 function pinned(payload) {
   const target = readJson(TARGET_FILE);
-  if (!target) fail("no target document. Run `ps.mjs target <title|id>` (or `target --active`) first.");
+  if (!validTarget(target)) fail("no target document. Run `ps.mjs target <title|id>` (or `target --active`) first.");
   return { ...payload, documentId: target.id, documentTitle: target.title };
+}
+
+// Keeps the stored title current after Save As renames the document
+function refreshTargetTitle(current, doc) {
+  if (doc && doc.id === current.id && doc.title !== current.title) return pin(doc);
+  return current;
 }
 
 async function target(query, flags) {
@@ -235,8 +257,9 @@ async function target(query, flags) {
   const { documents } = await sendJob("getDocumentState", { maxDepth: 0 });
   if (!query && !flags.active) {
     const current = readJson(TARGET_FILE);
-    if (!current) return { target: null, documents, hint: "No target. Run: ps.mjs target <title|id>" };
-    return { target: current, open: documents.some((d) => d.id === current.id), documents };
+    if (!validTarget(current)) return { target: null, documents, hint: "No target. Run: ps.mjs target <title|id>" };
+    const doc = documents.find((d) => d.id === current.id);
+    return { target: refreshTargetTitle(current, doc), open: !!doc, documents };
   }
   let matches;
   if (flags.active) {
@@ -249,9 +272,7 @@ async function target(query, flags) {
   const list = documents.map((d) => `${d.title} (id ${d.id})`).join(", ") || "none";
   if (!matches.length) fail(`no open document matches ${flags.active ? "--active" : JSON.stringify(query)}. Open: ${list}`);
   if (matches.length > 1) fail(`${matches.length} open documents are called ${JSON.stringify(query)}; pass the id instead. Open: ${list}`);
-  const pinnedDoc = { id: matches[0].id, title: matches[0].title };
-  writeJson(TARGET_FILE, pinnedDoc);
-  return { target: pinnedDoc };
+  return { target: pin(matches[0]) };
 }
 
 function readSource(arg) {
@@ -304,12 +325,14 @@ async function main() {
       break;
     case "state": {
       // Read-only, so it works without a target (then it describes the front document)
-      const current = readJson(TARGET_FILE);
+      let current = readJson(TARGET_FILE);
+      if (!validTarget(current)) current = null;
       const data = await sendJob("getDocumentState", {
         maxDepth: flags.depth !== undefined ? Number(flags.depth) : undefined,
         fullText: !!flags["full-text"],
         ...(current ? { documentId: current.id, documentTitle: current.title } : {}),
       });
+      if (current) current = refreshTargetTitle(current, data.document);
       out = { target: current, ...data };
       if (!current) out.hint = "No target. Run: ps.mjs target <title|id> before editing.";
       else if (data.targetMissing) out.hint = `Target ${current.title} (id ${current.id}) is no longer open. Run: ps.mjs target <title|id>`;
@@ -354,13 +377,35 @@ async function main() {
       if (!positional[0]) fail("open needs a file path");
       const file = path.resolve(positional[0]);
       if (!fs.existsSync(file)) fail(`no such file: ${file}`);
-      out = await sendJob("runScript", {
+      const { result: opened } = await sendJob("runScript", {
         code: "const opened = await app.open(await fileEntry(args.path)); return { id: opened.id, title: opened.title, width: opened.width, height: opened.height };",
         args: { path: file },
         history: false,
       });
-      writeJson(TARGET_FILE, { id: out.id, title: out.title });
-      out.pinned = true;
+      out = { ...opened, pinned: pin(opened) };
+      break;
+    }
+    case "new": {
+      const width = Number(flags.width);
+      const height = Number(flags.height);
+      if (!(width > 0 && height > 0)) fail("new needs --width and --height in pixels");
+      const fill = typeof flags.fill === "string" ? flags.fill : "white";
+      if (!["white", "black", "transparent", "backgroundColor"].includes(fill)) fail("--fill must be white, black, transparent or backgroundColor");
+      const { result: created } = await sendJob("runScript", {
+        code: [
+          "const created = await app.documents.add({ width: args.width, height: args.height, resolution: args.resolution, name: args.name, mode: 'RGBColorMode', fill: args.fill });",
+          "return { id: created.id, title: created.title, width: created.width, height: created.height, resolution: created.resolution };",
+        ].join("\n"),
+        args: {
+          width,
+          height,
+          resolution: flags.res ? Number(flags.res) : 72,
+          name: typeof flags.name === "string" ? flags.name : "Untitled",
+          fill,
+        },
+        history: false,
+      });
+      out = { ...created, pinned: pin(created), note: "Not saved yet. Use `save /abs/path.psd` to write it to disk." };
       break;
     }
     case "save": {
@@ -371,11 +416,13 @@ async function main() {
           "if (args.path) { await doc.saveAs.psd(await fileEntry(args.path, { create: true }), { maximizeCompatibility: true }); }",
           "else { await doc.save(); }",
           "let savedPath = args.path; try { savedPath = doc.path || args.path; } catch (e) {}",
-          "return { title: doc.title, path: savedPath };",
+          "return { id: doc.id, title: doc.title, path: savedPath };",
         ].join("\n"),
         args: { path: file },
         history: false,
       }));
+      // Save As renames the document; keep the pin's title in step
+      out.pinned = pin(out.result);
       break;
     }
     case "session": {
